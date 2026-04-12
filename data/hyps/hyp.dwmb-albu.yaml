@@ -1,0 +1,37 @@
+# Synced from gyolo/data/hyps/hyp.dwmb-albu.yaml (dwmb_model spec Y5_N24_640_2C).
+# Extra keys (e.g. nab_obj_weight, geometric) are ignored by stock YOLOv5 detect train if unused.
+
+#lr0: 0.01
+lr0: 0.001
+lrf: 0.09551
+momentum: 0.91097
+weight_decay: 0.00069
+warmup_epochs:  0 # 1
+warmup_momentum: 0.3728
+warmup_bias_lr: 0.05813
+box: 0.5 #0.02776
+cls: 1.0
+cls_pw: 1
+obj: 1.1454
+obj_pw: 0.87686
+nab_obj_weight: 3.0
+iou_t: 0.2
+anchor_t: 2
+fl_gamma: 2.0 #0.0
+fl_alpha: 0.25
+hsv_h: 0
+hsv_s: 0.2
+hsv_v: 0.23713
+degrees: 0
+translate: 0
+scale: 0.00
+shear: 0.0
+perspective: 0.0
+flipud: 0
+fliplr: 0
+mosaic: 0.0
+mixup: 0.0
+copy_paste: 0.0
+geometric: 0.8
+dropout: 0.8
+blur: 0
