@@ -6,6 +6,9 @@
 
 ultralytics==8.4.35
 
+# train.py imports check_git_info() → GitPython (import name ``git``)
+gitpython==3.1.40
+
 matplotlib==3.6.2
 numpy==1.23.4
 opencv-python==4.6.0.66
