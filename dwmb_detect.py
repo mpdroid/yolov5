@@ -163,7 +163,7 @@ def _forward_letterboxed_bgr(
     stride: int,
     half: bool,
 ) -> tuple[torch.Tensor, tuple[int, int], tuple[int, int]]:
-    """Letterbox BGR uint8 → tensor (1,3,H,W), forward. Returns pred[0], letterbox (h,w), crop (h,w)."""
+    """Letterbox BGR uint8 → tensor (1,3,H,W), forward. Returns pred, letterbox (h,w), crop (h,w)."""
     h0, w0 = im_bgr.shape[:2]
     img, _, _ = letterbox(im_bgr, (imgsz, imgsz), auto=True, stride=stride)
     lb_h, lb_w = img.shape[0], img.shape[1]
@@ -177,6 +177,43 @@ def _forward_letterboxed_bgr(
         out = model(t, augment=False)
         pred = out[0] if isinstance(out, (list, tuple)) else out
     return pred, (lb_h, lb_w), (h0, w0)
+
+
+def _forward_batch_letterboxed_bgr(
+    model: Any,
+    im_bgr_list: list["NDArray[np.uint8]"],
+    device: torch.device,
+    imgsz: int,
+    stride: int,
+    half: bool,
+) -> tuple[torch.Tensor, list[tuple[int, int]], list[tuple[int, int]]]:
+    """Letterbox a batch of BGR crops → ``(B,3,H,W)``, single forward.
+
+    Returns ``pred`` (typically ``(B, N, 5+nc)``), per-image letterbox ``(h,w)``, per-image crop ``(h0,w0)``.
+    """
+    if not im_bgr_list:
+        raise ValueError("empty batch")
+    chw_list: list[Any] = []
+    lb_hws: list[tuple[int, int]] = []
+    crop_hws: list[tuple[int, int]] = []
+    for im_bgr in im_bgr_list:
+        h0, w0 = im_bgr.shape[:2]
+        img, _, _ = letterbox(im_bgr, (imgsz, imgsz), auto=True, stride=stride)
+        lb_h, lb_w = int(img.shape[0]), int(img.shape[1])
+        im = np.ascontiguousarray(img.transpose((2, 0, 1)))
+        chw_list.append(im)
+        lb_hws.append((lb_h, lb_w))
+        crop_hws.append((h0, w0))
+    batch_np = np.stack(chw_list, axis=0)
+    t = torch.from_numpy(batch_np).to(device)
+    t = t.half() if half else t.float()
+    t /= 255.0
+    with torch.no_grad():
+        out = model(t, augment=False)
+        pred = out[0] if isinstance(out, (list, tuple)) else out
+    if pred.dim() == 2:
+        pred = pred.unsqueeze(0)
+    return pred, lb_hws, crop_hws
 
 
 def infer_image_dets_bgr(
@@ -223,6 +260,7 @@ def infer_tiled_to_global_xyxy(
     full_image_size: tuple[int, int],
     top_n_by_p_obj: int = 4096,
     max_det: int = 300,
+    tile_batch_size: int = 8,
 ) -> tuple[list[tuple[tuple[float, float, float, float], float, int]], float, int]:
     """Sliding-window inference on a full image; boxes in **full image** pixel coords (xyxy)."""
     from PIL import Image, ImageOps
@@ -232,41 +270,116 @@ def infer_tiled_to_global_xyxy(
     iw, ih = full_image_size
 
     tiles = _iter_tile_boxes(iw, ih, imgsz, tile_overlap)
+    tile_list = list(tiles)
     raw: list[tuple[tuple[float, float, float, float], float, int]] = []
     t0 = time.perf_counter()
+    bs = max(1, int(tile_batch_size))
     with Image.open(image_path) as im_full:
         im_full = ImageOps.exif_transpose(im_full.convert("RGB"))
-        for (x0, y0, x1, y1) in tiles:
-            crop = im_full.crop((x0, y0, x1, y1))
-            arr = np.asarray(crop, dtype=np.uint8)
-            im_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            dets = infer_image_dets_bgr(
-                model,
-                im_bgr,
-                dev,
-                imgsz=imgsz,
-                stride=stride,
-                half=half,
-                conf_thres=conf,
-                nms_iou=nms_iou,
-                top_n_by_p_obj=top_n_by_p_obj,
-                max_det=max_det,
+        for j in range(0, len(tile_list), bs):
+            chunk = tile_list[j : j + bs]
+            if len(chunk) == 1 or bs == 1:
+                (x0, y0, x1, y1) = chunk[0]
+                crop = im_full.crop((x0, y0, x1, y1))
+                arr = np.asarray(crop, dtype=np.uint8)
+                im_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                dets = infer_image_dets_bgr(
+                    model,
+                    im_bgr,
+                    dev,
+                    imgsz=imgsz,
+                    stride=stride,
+                    half=half,
+                    conf_thres=conf,
+                    nms_iou=nms_iou,
+                    top_n_by_p_obj=top_n_by_p_obj,
+                    max_det=max_det,
+                )
+                for (xyxy, sc, ci) in dets:
+                    px1, py1, px2, py2 = xyxy
+                    px1 += x0
+                    py1 += y0
+                    px2 += x0
+                    py2 += y0
+                    px1 = max(0.0, min(px1, float(iw)))
+                    px2 = max(0.0, min(px2, float(iw)))
+                    py1 = max(0.0, min(py1, float(ih)))
+                    py2 = max(0.0, min(py2, float(ih)))
+                    if px2 <= px1 or py2 <= py1:
+                        continue
+                    raw.append(((px1, py1, px2, py2), sc, ci))
+                continue
+
+            im_bgr_list: list["NDArray[np.uint8]"] = []
+            offsets: list[tuple[int, int]] = []
+            for (x0, y0, x1, y1) in chunk:
+                crop = im_full.crop((x0, y0, x1, y1))
+                arr = np.asarray(crop, dtype=np.uint8)
+                im_bgr_list.append(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+                offsets.append((x0, y0))
+            pred, lb_hws, crop_hws = _forward_batch_letterboxed_bgr(
+                model, im_bgr_list, dev, imgsz, stride, half
             )
-            for (xyxy, sc, ci) in dets:
-                px1, py1, px2, py2 = xyxy
-                px1 += x0
-                py1 += y0
-                px2 += x0
-                py2 += y0
-                px1 = max(0.0, min(px1, float(iw)))
-                px2 = max(0.0, min(px2, float(iw)))
-                py1 = max(0.0, min(py1, float(ih)))
-                py2 = max(0.0, min(py2, float(ih)))
-                if px2 <= px1 or py2 <= py1:
+
+            bsz = int(pred.shape[0])
+            if bsz != len(chunk):
+                for k, (x0, y0, x1, y1) in enumerate(chunk):
+                    im_bgr = im_bgr_list[k]
+                    dets = infer_image_dets_bgr(
+                        model,
+                        im_bgr,
+                        dev,
+                        imgsz=imgsz,
+                        stride=stride,
+                        half=half,
+                        conf_thres=conf,
+                        nms_iou=nms_iou,
+                        top_n_by_p_obj=top_n_by_p_obj,
+                        max_det=max_det,
+                    )
+                    for (xyxy, sc, ci) in dets:
+                        px1, py1, px2, py2 = xyxy
+                        px1 += x0
+                        py1 += y0
+                        px2 += x0
+                        py2 += y0
+                        px1 = max(0.0, min(px1, float(iw)))
+                        px2 = max(0.0, min(px2, float(iw)))
+                        py1 = max(0.0, min(py1, float(ih)))
+                        py2 = max(0.0, min(py2, float(ih)))
+                        if px2 <= px1 or py2 <= py1:
+                            continue
+                        raw.append(((px1, py1, px2, py2), sc, ci))
+                continue
+
+            for bi in range(bsz):
+                x0, y0 = offsets[bi]
+                pred_i = pred[bi : bi + 1]
+                xyxy, conf_t, cls_idx = decode_yolov5_predictions(
+                    pred_i,
+                    conf_thres=conf,
+                    top_n_by_p_obj=top_n_by_p_obj,
+                    nms_iou=nms_iou,
+                    max_det=max_det,
+                )
+                if xyxy.numel() == 0:
                     continue
-                raw.append(((px1, py1, px2, py2), sc, ci))
+                xyxy = scale_boxes(lb_hws[bi], xyxy, crop_hws[bi])
+                for i in range(xyxy.shape[0]):
+                    px1, py1, px2, py2 = (float(v) for v in xyxy[i].tolist())
+                    px1 += x0
+                    py1 += y0
+                    px2 += x0
+                    py2 += y0
+                    px1 = max(0.0, min(px1, float(iw)))
+                    px2 = max(0.0, min(px2, float(iw)))
+                    py1 = max(0.0, min(py1, float(ih)))
+                    py2 = max(0.0, min(py2, float(ih)))
+                    if px2 <= px1 or py2 <= py1:
+                        continue
+                    raw.append(((px1, py1, px2, py2), float(conf_t[i].item()), int(cls_idx[i].item())))
     elapsed = time.perf_counter() - t0
-    return raw, elapsed, len(tiles)
+    return raw, elapsed, len(tile_list)
 
 
 def main() -> int:
