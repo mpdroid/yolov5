@@ -126,9 +126,9 @@ def _select_torch_device(device: str | None) -> torch.device:
     if d == "mps":
         return torch.device("mps")
     if d.isdigit():
-        return torch.device(f"cuda:{d}")
+        return torch.device(f"cuda:{int(d)}") if torch.cuda.is_available() else torch.device("cpu")
     if d.startswith("cuda"):
-        return torch.device(d)
+        return torch.device((device or "").strip()) if torch.cuda.is_available() else torch.device("cpu")
     return torch.device(device or "cpu")
 
 
